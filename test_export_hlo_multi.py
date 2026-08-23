@@ -77,17 +77,13 @@ def check_sharded(fn, arrays, in_specs, out_spec, expect_collective):
     assert collective == expect_collective
 
 
-_x = mx.array(np.random.rand(N, 4).astype(np.float32))
-_y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
-
-
 @requires_multi
 @pytest.mark.parametrize(
-    "fn,arrays,in_specs,out_spec,expect",
+    "fn,pick,in_specs,out_spec,expect",
     [
         pytest.param(
             lambda a, b: mx.log(mx.abs(a - b)) * b,
-            [_x, _y],
+            lambda x, y: [x, y],
             [P("d"), P("d")],
             P("d"),
             False,
@@ -95,7 +91,7 @@ _y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
         ),
         pytest.param(
             lambda a: mx.sum(a, axis=0),
-            [_x],
+            lambda x, y: [x],
             [P("d")],
             P(),
             True,
@@ -103,5 +99,7 @@ _y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
         ),
     ],
 )
-def test_sharded(fn, arrays, in_specs, out_spec, expect):
-    check_sharded(fn, arrays, in_specs, out_spec, expect)
+def test_sharded(fn, pick, in_specs, out_spec, expect):
+    x = mx.array(np.random.rand(N, 4).astype(np.float32))
+    y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
+    check_sharded(fn, pick(x, y), in_specs, out_spec, expect)

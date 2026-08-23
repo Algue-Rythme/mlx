@@ -139,6 +139,8 @@ def _softmax(p):
     """Stable softmax over the last axis: exp(x - max) / sum(exp(x - max))."""
     x = _v(p["inputs"][0][0])
     o, shape, dtype = p["outputs"][0]
+    # MLX emits Softmax only for the last axis; non-last decomposes to Reduce.
+    assert len(p["arguments"]) == 1, "Softmax: unexpected argument schema"
     el = _DTYPES[dtype]
     ty = _tystr(shape, el)
     rty = _tystr(shape[:-1], el)
@@ -167,6 +169,11 @@ def _logsumexp(p):
     ty = _tystr(ishape, el)
     rty = _tystr(ishape[:-1], el)
     ax = len(ishape) - 1
+    # MLX emits LogSumExp only for the last axis, kept as size 1 in the output.
+    assert not p["arguments"], "LogSumExp: unexpected argument schema"
+    assert out_shape[-1] == 1 and tuple(out_shape[:-1]) == tuple(
+        ishape[:-1]
+    ), "LogSumExp: expected last-axis reduction"
     kept = range(ax)
     n = {s: _v(o + s) for s in ("mi", "m", "mb", "s", "e", "zi", "ss", "lg", "a")}
     return [
@@ -268,6 +275,9 @@ def _rmsnorm(p):
     x, w = _v(p["inputs"][0][0]), _v(p["inputs"][1][0])
     eps = p["arguments"][0]
     o, shape, dtype = p["outputs"][0]
+    assert tuple(p["inputs"][1][1]) == (
+        shape[-1],
+    ), "RMSNorm: weight must be 1-D over the last axis"
     el = _DTYPES[dtype]
     ty = _tystr(shape, el)
     rty = _tystr(shape[:-1], el)
@@ -293,6 +303,9 @@ def _layernorm(p):
     x, w, b = (_v(p["inputs"][i][0]) for i in range(3))
     eps = p["arguments"][0]
     o, shape, dtype = p["outputs"][0]
+    assert tuple(p["inputs"][1][1]) == (shape[-1],) and tuple(p["inputs"][2][1]) == (
+        shape[-1],
+    ), "LayerNorm: weight/bias must be 1-D over the last axis"
     el, ty = _DTYPES[dtype], _tystr(shape, _DTYPES[dtype])
     rty, wty = _tystr(shape[:-1], el), _tystr(shape[-1:], el)
     kept, last = range(len(shape) - 1), [len(shape) - 1]
@@ -472,6 +485,8 @@ def _stack_indices(prefix, idx_ops, idx_ins, g_shape, iel):
 
 
 def _primitive(p, precision):
+    # p["arguments"] is decoded positionally per MLX's primitive constructors;
+    # this is an unversioned contract, so schema mismatches must fail loud below.
     name = p["name"]
     ins = p["inputs"]
     args = p["arguments"]
@@ -493,7 +508,7 @@ def _primitive(p, precision):
     if name == "Log":
         if args[0] == 2:
             return [f"{out} = stablehlo.log {ops[0]} : {ty}"]
-        scale = _LOG2E if args[0] == 0 else _LOG10E
+        scale = {0: _LOG2E, 1: _LOG10E}[args[0]]  # 0=log2, 1=log10
         n0 = _v(out_name + "_l")
         n1 = _v(out_name + "_c")
         return [
