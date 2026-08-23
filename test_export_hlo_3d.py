@@ -1,3 +1,5 @@
+import os
+
 import jax
 import mlx.core as mx
 import numpy as np
@@ -16,8 +18,22 @@ mx.random.seed(0)
 np.random.seed(0)
 
 B, T, V, D, H, HD, FF = 4, 4, 16, 8, 2, 4, 16
-_devices = jax.devices("cpu")
-requires_8 = pytest.mark.skipif(len(_devices) < 8, reason="need 8 emulated CPU devices")
+_PLATFORM = os.environ.get("EXPORT_HLO_PLATFORM") or xb.get_backend().platform
+_devices = jax.devices(_PLATFORM)
+
+
+# Explicit meshes: (label, (dp, tp, cp)). Each runs only where its device count
+# is available: 2x2x1 uses 4 devices (FSDP + TP), 2x2x2 uses 8 (+ context).
+MESHES = [("fsdp_tp", (2, 2, 1)), ("fsdp_tp_cp", (2, 2, 2))]
+
+
+def _mesh_params():
+    params = []
+    for label, (dp, tp, cp) in MESHES:
+        need = dp * tp * cp
+        mark = pytest.mark.skipif(len(_devices) < need, reason=f"need {need} devices")
+        params.append(pytest.param(dp, tp, cp, id=label, marks=mark))
+    return params
 
 
 def _ln(x, g, b):
@@ -56,7 +72,7 @@ def train_step(*flat):
 
 
 def to_exported(text, in_avals, out_avals):
-    backend = xb.get_backend("cpu")
+    backend = xb.get_backend(_PLATFORM)
     with jmlir.make_ir_context():
         module = ir.Module.parse(text)
         ver = hlo.get_version_from_compatibility_requirement(
@@ -93,8 +109,8 @@ def _rp(*shape):
     return mx.array((np.random.rand(*shape) * 0.2 - 0.1).astype(np.float32))
 
 
-@requires_8
-def test_transformer_fsdp_tp_cp():
+@pytest.mark.parametrize("dp,tp,cp", _mesh_params())
+def test_transformer_fsdp_tp_cp(dp, tp, cp):
     params = [
         _rp(V, D),
         _rp(D, D),
@@ -122,7 +138,10 @@ def test_transformer_fsdp_tp_cp():
     out_avals = [jax.core.ShapedArray(o.shape, o.dtype) for o in ref]
     exp = to_exported(export_to_hlo(train_step, *args), in_avals, out_avals)
 
-    mesh = Mesh(np.array(_devices[:8]).reshape(2, 2, 2), ("dp", "tp", "cp"))
+    mesh = Mesh(
+        np.array(_devices[: dp * tp * cp]).reshape(dp, tp, cp),
+        ("dp", "tp", "cp"),
+    )
     DP, TP, CP = "dp", "tp", "cp"
     # FSDP shards params+batch on dp; Megatron TP on tp; context-parallel seq on cp.
     param_specs = [

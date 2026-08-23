@@ -1,3 +1,5 @@
+import os
+
 import jax
 import mlx.core as mx
 import numpy as np
@@ -15,15 +17,14 @@ from mlx.export_hlo import export_to_hlo
 mx.random.seed(0)
 np.random.seed(0)
 
-N = 8
-_devices = jax.devices("cpu")
-requires_8 = pytest.mark.skipif(
-    len(_devices) < N, reason=f"need {N} emulated CPU devices"
-)
+_PLATFORM = os.environ.get("EXPORT_HLO_PLATFORM") or xb.get_backend().platform
+_devices = jax.devices(_PLATFORM)
+N = len(_devices)
+requires_multi = pytest.mark.skipif(N < 2, reason="need at least 2 devices")
 
 
 def to_exported(text, in_avals, out_aval):
-    backend = xb.get_backend("cpu")
+    backend = xb.get_backend(_PLATFORM)
     with jmlir.make_ir_context():
         module = ir.Module.parse(text)
         ver = hlo.get_version_from_compatibility_requirement(
@@ -44,7 +45,7 @@ def to_exported(text, in_avals, out_aval):
         in_shardings_hlo=(None,) * n,
         out_shardings_hlo=(None,),
         nr_devices=1,
-        platforms=("cpu",),
+        platforms=(_PLATFORM,),
         ordered_effects=(),
         unordered_effects=(),
         disabled_safety_checks=(),
@@ -64,7 +65,7 @@ def check_sharded(fn, arrays, in_specs, out_spec, expect_collective):
     out_aval = jax.core.ShapedArray(ref.shape, ref.dtype)
     exp = to_exported(export_to_hlo(fn, *arrays), in_avals, out_aval)
 
-    mesh = Mesh(np.array(_devices[:N]), ("d",))
+    mesh = Mesh(np.array(_devices), ("d",))
     in_sh = [NamedSharding(mesh, s) for s in in_specs]
     out_sh = NamedSharding(mesh, out_spec)
     f = jax.jit(exp.call, in_shardings=tuple(in_sh), out_shardings=out_sh)
@@ -80,7 +81,7 @@ _x = mx.array(np.random.rand(N, 4).astype(np.float32))
 _y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
 
 
-@requires_8
+@requires_multi
 @pytest.mark.parametrize(
     "fn,arrays,in_specs,out_spec,expect",
     [
