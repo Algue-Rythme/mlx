@@ -1,6 +1,9 @@
+import os
 import sys
 
-sys.path.insert(0, "/Users/louisbethune/code/mlx/python")
+_local = "/Users/louisbethune/code/mlx/python"
+if os.path.isdir(_local):
+    sys.path.insert(0, _local)
 
 import jax
 import mlx.core as mx
@@ -13,17 +16,44 @@ from jaxlib.mlir.dialects import chlo, stablehlo  # noqa: F401
 from mlx.export_hlo import export_to_hlo
 
 
+def _parse_args():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Validate MLX StableHLO export against XLA."
+    )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--tpu", action="store_true", help="run on the TPU backend")
+    g.add_argument("--platform", default=None, help="XLA platform: cpu, cuda, tpu")
+    return p.parse_args()
+
+
+_args = _parse_args() if __name__ == "__main__" else None
+_PLATFORM = "tpu" if (_args and _args.tpu) else (_args.platform if _args else None)
+_ON_TPU = _PLATFORM == "tpu"
+
+_BACKENDS = {}
+
+
+def _get_backend():
+    if _PLATFORM not in _BACKENDS:
+        _BACKENDS[_PLATFORM] = (
+            xb.get_backend(_PLATFORM) if _PLATFORM else xb.get_backend()
+        )
+    return _BACKENDS[_PLATFORM]
+
+
 def run_xla(text, inputs):
-    backend = xb.get_backend()
+    backend = _get_backend()
+    dev = backend.local_devices()[0]
     with jmlir.make_ir_context():
         module = ir.Module.parse(text)
-        devs = backend.local_devices()
         exe = backend.compile_and_load(
             module,
-            executable_devices=xc.DeviceList(tuple(devs[:1])),
+            executable_devices=xc.DeviceList((dev,)),
             compile_options=xc.CompileOptions(),
         )
-    res = exe.execute_sharded([jax.device_put(x) for x in inputs])
+    res = exe.execute_sharded([jax.device_put(x, dev) for x in inputs])
     return res.disassemble_into_single_device_arrays()
 
 
@@ -37,6 +67,14 @@ def check(fn, *arrays):
         print("mlx:", r.ravel(), "xla:", o.ravel())
         assert np.allclose(o, r, atol=1e-4), "mismatch"
     print("OK")
+
+
+def _skip_complex(*a, **k):
+    print("skip (complex unsupported on TPU)")
+
+
+# Complex ops (real/imag/conj) are not supported on TPU; skip them there.
+check_complex = _skip_complex if _ON_TPU else check
 
 
 def fn(x, y):
@@ -116,7 +154,7 @@ outs = run_xla(text, [np.array(spd)])
 assert np.allclose(np.asarray(outs[0]).reshape(ref.shape), ref, atol=1e-4)
 print("cholesky OK")
 
-check(
+check_complex(
     lambda a: mx.real(a) + mx.imag(a),
     mx.array(np.array([[1 + 2j, 3 - 1j]], dtype=np.complex64)),
 )
@@ -140,7 +178,9 @@ noe = {
     "inputs": [("A", (4, 8), mx.float32)],
     "outputs": [("B", (), mx.float32)],
 }
-assert _primitive(noe) == ["%B = stablehlo.constant dense<0.125> : tensor<f32>"]
+assert _primitive(noe, "HIGHEST") == [
+    "%B = stablehlo.constant dense<0.125> : tensor<f32>"
+]
 print("number_of_elements OK")
 
 check(lambda a: mx.softmax(a, axis=-1), mx.random.uniform(shape=(3, 5)))
@@ -156,7 +196,7 @@ check(lambda a: mx.sinh(a) + mx.cosh(a), mx.random.uniform(shape=(3, 5)))
 check(lambda a: mx.expm1(a) + mx.log1p(a), mx.random.uniform(shape=(3, 5)))
 check(lambda a: mx.log2(a), mx.random.uniform(shape=(3, 5)) + 1)
 check(lambda a: mx.log10(a), mx.random.uniform(shape=(3, 5)) + 1)
-check(
+check_complex(
     lambda a: mx.conj(a),
     mx.array(np.array([[1 + 2j, 3 - 4j], [5 + 6j, 7 - 8j]], dtype=np.complex64)),
 )

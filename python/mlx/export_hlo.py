@@ -29,6 +29,8 @@ _MAX_CONST_SIZE = 1 << 16
 _LOG2E = 1.4426950408889634
 _LOG10E = 0.4342944819032518
 
+_PRECISION = {"default": "DEFAULT", "high": "HIGH", "highest": "HIGHEST"}
+
 _UNARY = {
     "Abs": "abs",
     "Negative": "negate",
@@ -469,7 +471,7 @@ def _stack_indices(prefix, idx_ops, idx_ins, g_shape, iel):
     return lines, si, si_ty
 
 
-def _primitive(p):
+def _primitive(p, precision):
     name = p["name"]
     ins = p["inputs"]
     args = p["arguments"]
@@ -569,8 +571,9 @@ def _primitive(p):
         cd = f"contracting_dims = [{r - 1}] x [{r - 2}]"
         rhs_ty = _type(ins[1][1], ins[1][2])
         dot = _v(out_name + "_mm")
+        pc = f"precision = [{precision}, {precision}]"
         lines = [
-            f"{dot} = stablehlo.dot_general {ops[0]}, {ops[1]}, {bd}{cd} : "
+            f"{dot} = stablehlo.dot_general {ops[0]}, {ops[1]}, {bd}{cd}, {pc} : "
             f"({in_ty}, {rhs_ty}) -> {ty}"
         ]
         lhs, rhs = dot, ops[2]
@@ -627,8 +630,9 @@ def _primitive(p):
         bd = f"batching_dims = [{b}] x [{b}], " if r > 2 else ""
         cd = f"contracting_dims = [{r - 1}] x [{r - 2}]"
         rhs_ty = _type(ins[1][1], ins[1][2])
+        pc = f"precision = [{precision}, {precision}]"
         return [
-            f"{out} = stablehlo.dot_general {ops[0]}, {ops[1]}, {bd}{cd} : "
+            f"{out} = stablehlo.dot_general {ops[0]}, {ops[1]}, {bd}{cd}, {pc} : "
             f"({in_ty}, {rhs_ty}) -> {ty}"
         ]
     if name == "Slice":
@@ -754,12 +758,14 @@ def _primitive(p):
         pad = ", ".join(f"[{lo}, {hi}]" for lo, hi in zip(pad_lo, pad_hi))
         rev = ", ".join(["true" if flip else "false"] * nd)
         w_ty = _type(ins[1][1], ins[1][2])
+        pc = f"#stablehlo<precision {precision}>"
         return [
             f"{out} = stablehlo.convolution({ops[0]}, {ops[1]}) dim_numbers = {dn}, "
             f"window = {{stride = [{', '.join(map(str, strides))}], pad = [{pad}], "
             f"lhs_dilate = [{', '.join(map(str, idil))}], "
             f"rhs_dilate = [{', '.join(map(str, kdil))}], reverse = [{rev}]}} "
-            f"{{batch_group_count = 1 : i64, feature_group_count = {groups} : i64}} : "
+            f"{{batch_group_count = 1 : i64, feature_group_count = {groups} : i64, "
+            f"precision_config = [{pc}, {pc}]}} : "
             f"({in_ty}, {w_ty}) -> {ty}"
         ]
 
@@ -920,7 +926,7 @@ def _composite(p, cname, decomp, idx):
     return [call], _func(fname, fp["inputs"], fp["outputs"], decomp(fp))
 
 
-def _build(events, composites=frozenset()):
+def _build(events, composites=frozenset(), precision="highest"):
     inputs, outputs, constants, primitives = [], [], [], []
     for e in events:
         t = e["type"]
@@ -938,6 +944,7 @@ def _build(events, composites=frozenset()):
     res = res_types[0] if len(res_types) == 1 else "(" + ", ".join(res_types) + ")"
 
     cmap = _COMPOSITE
+    prec = _PRECISION[precision]
     lines = [f"    {_constant(n, a)}" for n, a in constants]
     funcs = []
     for i, p in enumerate(primitives):
@@ -947,7 +954,7 @@ def _build(events, composites=frozenset()):
             lines.extend(f"    {ln}" for ln in cl)
             funcs.append(fn)
         else:
-            lines.extend(f"    {ln}" for ln in _primitive(p))
+            lines.extend(f"    {ln}" for ln in _primitive(p, prec))
     out_vals = ", ".join(_v(n) for n, _, _ in outputs)
     lines.append(f"    return {out_vals} : {', '.join(res_types)}")
 
@@ -955,7 +962,9 @@ def _build(events, composites=frozenset()):
     return "module @m {\n" + "\n".join([main, *funcs]) + "\n}\n"
 
 
-def export_to_hlo(fn: Callable, *args, composites=frozenset(), **kwargs) -> str:
+def export_to_hlo(
+    fn: Callable, *args, composites=frozenset(), precision="highest", **kwargs
+) -> str:
     """Trace ``fn`` on the given inputs and return a StableHLO module as text.
 
     Args:
@@ -963,6 +972,9 @@ def export_to_hlo(fn: Callable, *args, composites=frozenset(), **kwargs) -> str:
         args: Example positional inputs used to trace ``fn``.
         composites (set): Primitive names to emit as ``stablehlo.composite`` ops
             (with a decomposition body) instead of inlining, e.g. ``{"RMSNorm"}``.
+        precision (str): Matmul/convolution precision, one of ``"default"``,
+            ``"high"``, ``"highest"``. ``"highest"`` matches MLX's fp32 accumulation
+            on all backends; ``"default"`` lets the backend pick (e.g. bf16 on TPU).
         kwargs: Example keyword inputs used to trace ``fn``.
 
     Returns:
@@ -970,7 +982,7 @@ def export_to_hlo(fn: Callable, *args, composites=frozenset(), **kwargs) -> str:
     """
     events = []
     mx.export_function(events.append, fn, *args, **kwargs)
-    return _build(events, composites)
+    return _build(events, composites, precision)
 
 
 def _flat(tree):
@@ -991,13 +1003,16 @@ def unflatten_out(leaves: list, out_keys: list) -> Any:
     return tree_unflatten(list(zip(out_keys, leaves)))
 
 
-def export_tree(fn: Callable, *args, composites=frozenset()) -> tuple:
+def export_tree(
+    fn: Callable, *args, composites=frozenset(), precision="highest"
+) -> tuple:
     """Export ``fn`` over pytree arguments (e.g. an ``nn.Module``'s parameters).
 
     Args:
         fn (callable): Function taking pytree args and returning any pytree of arrays.
         args: Example pytree inputs (nested dicts/lists of arrays, or bare arrays).
         composites (set): Primitive names to emit as ``stablehlo.composite`` ops.
+        precision (str): Matmul/convolution precision; see :func:`export_to_hlo`.
 
     Returns:
         tuple: ``(hlo_text, out_keys)``. Flatten call inputs with :func:`flatten_args`
@@ -1020,4 +1035,7 @@ def export_tree(fn: Callable, *args, composites=frozenset()) -> tuple:
         out_keys.append(oks)
         return out_leaves
 
-    return export_to_hlo(flat_fn, *leaves, composites=composites), out_keys[0]
+    return (
+        export_to_hlo(flat_fn, *leaves, composites=composites, precision=precision),
+        out_keys[0],
+    )
