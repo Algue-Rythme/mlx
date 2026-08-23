@@ -191,10 +191,8 @@ def test_adam_transformer_fsdp_tp_cp(dp, tp, cp):
     y = mx.array(np.random.randint(0, V, (B, T)), dtype=mx.uint32)
     args = (params, m, v, t, x, y)
 
-    # Trace under a CPU stream so fused RoPE / RMSNorm decompose to base ops.
-    with mx.stream(mx.cpu):
-        ref_leaves = [o for _, o in tree_flatten(adam_step(*args))]
-        text, _ = export_tree(adam_step, *args)
+    ref_leaves = [o for _, o in tree_flatten(adam_step(*args))]
+    text, _ = export_tree(adam_step, *args)
     ref = [np.array(o.astype(mx.float32)) for o in ref_leaves]
 
     flat_in = flatten_args(*args)

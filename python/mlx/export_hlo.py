@@ -336,6 +336,116 @@ _COMPOSITE = {
     "LayerNorm": ("mlx.layer_norm", _layernorm),
 }
 
+
+def _rope(p):
+    """RoPE over the last axis: rotate feature pairs by position-dependent angles."""
+    x, off = _v(p["inputs"][0][0]), _v(p["inputs"][1][0])
+    off_ty = _type(p["inputs"][1][1], p["inputs"][1][2])
+    dims, traditional, base, scale, forward = p["arguments"]
+    o, shape, dtype = p["outputs"][0]
+    assert len(p["inputs"]) == 2, "RoPE: custom freqs not supported"
+    assert tuple(p["inputs"][1][1]) == (), "RoPE: only scalar offset supported"
+    assert dims % 2 == 0 and dims <= shape[-1], "RoPE: dims must be even and <= last"
+    el = _DTYPES[dtype]
+    r, half = len(shape), dims // 2
+    T = shape[-2]
+    n = lambda s: _v(o + s)
+    x_ty = _type(shape, dtype)
+    tf, hf, thf = _tystr((T,), "f32"), _tystr((half,), "f32"), _tystr((T, half), "f32")
+    the = _tystr((T, half), el)
+    inv = ", ".join(repr(float(base) ** (-i / half)) for i in range(half))
+    lines = [
+        f"{n('_io')} = stablehlo.iota dim = 0 : {tf}",
+        f"{n('_of')} = stablehlo.convert {off} : ({off_ty}) -> tensor<f32>",
+        f"{n('_ob')} = stablehlo.broadcast_in_dim {n('_of')}, dims = [] : "
+        f"(tensor<f32>) -> {tf}",
+        f"{n('_ps')} = stablehlo.add {n('_io')}, {n('_ob')} : {tf}",
+        f"{n('_sc')} = stablehlo.constant dense<{float(scale)!r}> : {tf}",
+        f"{n('_po')} = stablehlo.multiply {n('_ps')}, {n('_sc')} : {tf}",
+        f"{n('_iv')} = stablehlo.constant dense<[{inv}]> : {hf}",
+        f"{n('_pb')} = stablehlo.broadcast_in_dim {n('_po')}, dims = [0] : "
+        f"({tf}) -> {thf}",
+        f"{n('_ib')} = stablehlo.broadcast_in_dim {n('_iv')}, dims = [1] : "
+        f"({hf}) -> {thf}",
+        f"{n('_th')} = stablehlo.multiply {n('_pb')}, {n('_ib')} : {thf}",
+        f"{n('_cf')} = stablehlo.cosine {n('_th')} : {thf}",
+        f"{n('_sf')} = stablehlo.sine {n('_th')} : {thf}",
+    ]
+    cs, sn = n("_cf"), n("_sf")
+    if el != "f32":
+        lines += [
+            f"{n('_cc')} = stablehlo.convert {cs} : ({thf}) -> {the}",
+            f"{n('_sc2')} = stablehlo.convert {sn} : ({thf}) -> {the}",
+        ]
+        cs, sn = n("_cc"), n("_sc2")
+    pair_ty = _tystr(tuple(shape[:-1]) + (half,), el)
+    lines += [
+        f"{n('_cb')} = stablehlo.broadcast_in_dim {cs}, dims = [{r - 2}, {r - 1}] : "
+        f"({the}) -> {pair_ty}",
+        f"{n('_sb')} = stablehlo.broadcast_in_dim {sn}, dims = [{r - 2}, {r - 1}] : "
+        f"({the}) -> {pair_ty}",
+    ]
+    full = ", ".join(f"0:{shape[d]}:1" for d in range(r - 1))
+
+    def cut(dst, lo, hi, step):
+        spec = f"{full}, {lo}:{hi}:{step}"
+        return f"{dst} = stablehlo.slice {x} [{spec}] : ({x_ty}) -> {pair_ty}"
+
+    if traditional:
+        lines += [cut(n("_x1"), 0, dims, 2), cut(n("_x2"), 1, dims, 2)]
+    else:
+        lines += [cut(n("_x1"), 0, half, 1), cut(n("_x2"), half, dims, 1)]
+    x1, x2 = n("_x1"), n("_x2")
+    lines += [
+        f"{n('_a')} = stablehlo.multiply {x1}, {n('_cb')} : {pair_ty}",
+        f"{n('_b')} = stablehlo.multiply {x2}, {n('_sb')} : {pair_ty}",
+        f"{n('_c')} = stablehlo.multiply {x1}, {n('_sb')} : {pair_ty}",
+        f"{n('_d')} = stablehlo.multiply {x2}, {n('_cb')} : {pair_ty}",
+    ]
+    if forward:
+        lines += [
+            f"{n('_o1')} = stablehlo.subtract {n('_a')}, {n('_b')} : {pair_ty}",
+            f"{n('_o2')} = stablehlo.add {n('_c')}, {n('_d')} : {pair_ty}",
+        ]
+    else:
+        lines += [
+            f"{n('_o1')} = stablehlo.add {n('_a')}, {n('_b')} : {pair_ty}",
+            f"{n('_o2')} = stablehlo.subtract {n('_d')}, {n('_c')} : {pair_ty}",
+        ]
+    o1, o2 = n("_o1"), n("_o2")
+    tail = shape[-1] > dims
+    if traditional:
+        e_ty = _tystr(tuple(shape[:-1]) + (half, 1), el)
+        rot_ty = _tystr(tuple(shape[:-1]) + (half, 2), el)
+        dims_ty = _tystr(tuple(shape[:-1]) + (dims,), el)
+        lines += [
+            f"{n('_e1')} = stablehlo.reshape {o1} : ({pair_ty}) -> {e_ty}",
+            f"{n('_e2')} = stablehlo.reshape {o2} : ({pair_ty}) -> {e_ty}",
+            f"{n('_cat')} = stablehlo.concatenate {n('_e1')}, {n('_e2')}, dim = {r} : "
+            f"({e_ty}, {e_ty}) -> {rot_ty}",
+            f"{n('_rot')} = stablehlo.reshape {n('_cat')} : ({rot_ty}) -> {dims_ty}",
+        ]
+        rot, rot_ty2 = n("_rot"), dims_ty
+    else:
+        rot_ty2 = _tystr(tuple(shape[:-1]) + (dims,), el)
+        lines.append(
+            f"{n('_rot')} = stablehlo.concatenate {o1}, {o2}, dim = {r - 1} : "
+            f"({pair_ty}, {pair_ty}) -> {rot_ty2}"
+        )
+        rot = n("_rot")
+    if tail:
+        tail_ty = _tystr(tuple(shape[:-1]) + (shape[-1] - dims,), el)
+        lines += [
+            f"{n('_tl')} = stablehlo.slice {x} [{full}, {dims}:{shape[-1]}:1] : "
+            f"({x_ty}) -> {tail_ty}",
+            f"{_v(o)} = stablehlo.concatenate {rot}, {n('_tl')}, dim = {r - 1} : "
+            f"({rot_ty2}, {tail_ty}) -> {x_ty}",
+        ]
+    else:
+        lines.append(f"{_v(o)} = stablehlo.reshape {rot} : ({rot_ty2}) -> {x_ty}")
+    return lines
+
+
 _THREEFRY_ROT = [[13, 15, 26, 6], [17, 29, 16, 24]]
 
 
@@ -411,6 +521,108 @@ def _randombits(p):
     add(
         f"{_v(o)} = stablehlo.concatenate {cf}, {cs}, dim = 0 : "
         f"({uh}, {uh}) -> {_tystr(out_shape, el)}"
+    )
+    return lines
+
+
+def _rmsnormvjp(p):
+    """VJP of RMSNorm: returns dx, dw for x * rsqrt(mean(x^2) + eps) * w."""
+    x, w, g = (_v(p["inputs"][i][0]) for i in range(3))
+    eps = p["arguments"][0]
+    dxn, shape, dtype = p["outputs"][0]
+    dwn = p["outputs"][1][0]
+    assert tuple(p["inputs"][1][1]) == (
+        shape[-1],
+    ), "RMSNormVJP: weight must be 1-D over the last axis"
+    el = _DTYPES[dtype]
+    ty, rty, wty = _tystr(shape, el), _tystr(shape[:-1], el), _tystr(shape[-1:], el)
+    kept, last = range(len(shape) - 1), [len(shape) - 1]
+    nm = lambda s: _v(dxn + s)
+    lines = [f"{nm('_sq')} = stablehlo.multiply {x}, {x} : {ty}"]
+    ml, ms = _mean_last(dxn + "_ms", nm("_sq"), shape, el)
+    lines += ml + [
+        f"{nm('_e')} = stablehlo.constant dense<{eps!r}> : {rty}",
+        f"{nm('_me')} = stablehlo.add {ms}, {nm('_e')} : {rty}",
+        f"{nm('_n')} = stablehlo.rsqrt {nm('_me')} : {rty}",
+        f"{nm('_n2')} = stablehlo.multiply {nm('_n')}, {nm('_n')} : {rty}",
+        f"{nm('_n3')} = stablehlo.multiply {nm('_n2')}, {nm('_n')} : {rty}",
+        _bcast(nm("_wb"), w, last, wty, ty),
+        f"{nm('_gw')} = stablehlo.multiply {g}, {nm('_wb')} : {ty}",
+        f"{nm('_gwx')} = stablehlo.multiply {nm('_gw')}, {x} : {ty}",
+    ]
+    tl, tm = _mean_last(dxn + "_t", nm("_gwx"), shape, el)
+    lines += tl + [
+        _bcast(nm("_tb"), tm, kept, rty, ty),
+        f"{nm('_xt')} = stablehlo.multiply {x}, {nm('_tb')} : {ty}",
+        _bcast(nm("_n3b"), nm("_n3"), kept, rty, ty),
+        f"{nm('_tf')} = stablehlo.multiply {nm('_xt')}, {nm('_n3b')} : {ty}",
+        _bcast(nm("_nb"), nm("_n"), kept, rty, ty),
+        f"{nm('_gwn')} = stablehlo.multiply {nm('_gw')}, {nm('_nb')} : {ty}",
+        f"{_v(dxn)} = stablehlo.subtract {nm('_gwn')}, {nm('_tf')} : {ty}",
+        f"{nm('_xn')} = stablehlo.multiply {x}, {nm('_nb')} : {ty}",
+        f"{nm('_gxn')} = stablehlo.multiply {g}, {nm('_xn')} : {ty}",
+        f"{nm('_zi')} = stablehlo.constant dense<0.0> : tensor<{el}>",
+        _reduce(_v(dwn), "add", nm("_gxn"), nm("_zi"), list(kept), ty, el, wty),
+    ]
+    return lines
+
+
+def _layernormvjp(p):
+    """VJP of LayerNorm: returns dx, dw, db."""
+    x, w, b, g = (_v(p["inputs"][i][0]) for i in range(4))
+    eps = p["arguments"][0]
+    dxn, shape, dtype = p["outputs"][0]
+    dwn, dbn = p["outputs"][1][0], p["outputs"][2][0]
+    assert tuple(p["inputs"][1][1]) == (shape[-1],) and tuple(p["inputs"][2][1]) == (
+        shape[-1],
+    ), "LayerNormVJP: weight/bias must be 1-D over the last axis"
+    el = _DTYPES[dtype]
+    ty, rty, wty = _tystr(shape, el), _tystr(shape[:-1], el), _tystr(shape[-1:], el)
+    kept, last = range(len(shape) - 1), [len(shape) - 1]
+    nm = lambda s: _v(dxn + s)
+    lines = [f"{nm('_sq')} = stablehlo.multiply {x}, {x} : {ty}"]
+    mul, mu = _mean_last(dxn + "_mu", x, shape, el)
+    m2l, mu2 = _mean_last(dxn + "_m2", nm("_sq"), shape, el)
+    lines += (
+        mul
+        + m2l
+        + [
+            f"{nm('_mus')} = stablehlo.multiply {mu}, {mu} : {rty}",
+            f"{nm('_var')} = stablehlo.subtract {mu2}, {nm('_mus')} : {rty}",
+            f"{nm('_e')} = stablehlo.constant dense<{eps!r}> : {rty}",
+            f"{nm('_ve')} = stablehlo.add {nm('_var')}, {nm('_e')} : {rty}",
+            f"{nm('_n')} = stablehlo.rsqrt {nm('_ve')} : {rty}",
+            f"{nm('_n2')} = stablehlo.multiply {nm('_n')}, {nm('_n')} : {rty}",
+            f"{nm('_n3')} = stablehlo.multiply {nm('_n2')}, {nm('_n')} : {rty}",
+            _bcast(nm("_mub"), mu, kept, rty, ty),
+            f"{nm('_xc')} = stablehlo.subtract {x}, {nm('_mub')} : {ty}",
+            _bcast(nm("_wb"), w, last, wty, ty),
+            f"{nm('_wg')} = stablehlo.multiply {nm('_wb')}, {g} : {ty}",
+        ]
+    )
+    swl, swg = _mean_last(dxn + "_sw", nm("_wg"), shape, el)
+    lines.append(f"{nm('_wgxc')} = stablehlo.multiply {nm('_wg')}, {nm('_xc')} : {ty}")
+    sxl, swgxc = _mean_last(dxn + "_sx", nm("_wgxc"), shape, el)
+    lines += (
+        swl
+        + sxl
+        + [
+            _bcast(nm("_sxb"), swgxc, kept, rty, ty),
+            f"{nm('_xcsx')} = stablehlo.multiply {nm('_xc')}, {nm('_sxb')} : {ty}",
+            _bcast(nm("_n3b"), nm("_n3"), kept, rty, ty),
+            f"{nm('_t1')} = stablehlo.multiply {nm('_xcsx')}, {nm('_n3b')} : {ty}",
+            _bcast(nm("_swb"), swg, kept, rty, ty),
+            f"{nm('_wgs')} = stablehlo.subtract {nm('_wg')}, {nm('_swb')} : {ty}",
+            _bcast(nm("_nb"), nm("_n"), kept, rty, ty),
+            f"{nm('_t2')} = stablehlo.multiply {nm('_wgs')}, {nm('_nb')} : {ty}",
+            f"{_v(dxn)} = stablehlo.subtract {nm('_t2')}, {nm('_t1')} : {ty}",
+            f"{nm('_xcn')} = stablehlo.multiply {nm('_xc')}, {nm('_nb')} : {ty}",
+            f"{nm('_gxcn')} = stablehlo.multiply {g}, {nm('_xcn')} : {ty}",
+            f"{nm('_zi')} = stablehlo.constant dense<0.0> : tensor<{el}>",
+            _reduce(_v(dwn), "add", nm("_gxcn"), nm("_zi"), list(kept), ty, el, wty),
+            f"{nm('_zb')} = stablehlo.constant dense<0.0> : tensor<{el}>",
+            _reduce(_v(dbn), "add", g, nm("_zb"), list(kept), ty, el, wty),
+        ]
     )
     return lines
 
@@ -546,6 +758,12 @@ def _primitive(p, precision):
         return _rmsnorm(p)
     if name == "LayerNorm":
         return _layernorm(p)
+    if name == "RoPE":
+        return _rope(p)
+    if name == "RMSNormVJP":
+        return _rmsnormvjp(p)
+    if name == "LayerNormVJP":
+        return _layernormvjp(p)
     if name == "RandomBits":
         return _randombits(p)
     if name == "Split":
