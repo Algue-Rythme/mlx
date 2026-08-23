@@ -93,7 +93,7 @@ def to_exported(text, in_avals, out_avals):
         in_shardings_hlo=(None,) * ni,
         out_shardings_hlo=(None,) * no,
         nr_devices=1,
-        platforms=("cpu",),
+        platforms=(_PLATFORM,),
         ordered_effects=(),
         unordered_effects=(),
         disabled_safety_checks=(),
