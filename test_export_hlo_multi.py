@@ -1,14 +1,7 @@
-import os
-
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-
-import sys
-
-sys.path.insert(0, "/Users/louisbethune/code/mlx/python")
-
 import jax
 import mlx.core as mx
 import numpy as np
+import pytest
 from jax import export as jexport
 from jax._src import xla_bridge as xb
 from jax._src.interpreters import mlir as jmlir
@@ -19,11 +12,18 @@ from jaxlib import _jax
 from jaxlib.mlir.dialects import stablehlo as hlo
 from mlx.export_hlo import export_to_hlo
 
+mx.random.seed(0)
+np.random.seed(0)
+
 N = 8
+_devices = jax.devices("cpu")
+requires_8 = pytest.mark.skipif(
+    len(_devices) < N, reason=f"need {N} emulated CPU devices"
+)
 
 
 def to_exported(text, in_avals, out_aval):
-    backend = xb.get_backend()
+    backend = xb.get_backend("cpu")
     with jmlir.make_ir_context():
         module = ir.Module.parse(text)
         ver = hlo.get_version_from_compatibility_requirement(
@@ -56,7 +56,7 @@ def to_exported(text, in_avals, out_aval):
     )
 
 
-def check_sharded(fn, arrays, in_specs, out_spec, expect_collective=False):
+def check_sharded(fn, arrays, in_specs, out_spec, expect_collective):
     ref = np.array(fn(*arrays))
     in_avals = [
         jax.core.ShapedArray(np.array(a).shape, np.array(a).dtype) for a in arrays
@@ -64,7 +64,7 @@ def check_sharded(fn, arrays, in_specs, out_spec, expect_collective=False):
     out_aval = jax.core.ShapedArray(ref.shape, ref.dtype)
     exp = to_exported(export_to_hlo(fn, *arrays), in_avals, out_aval)
 
-    mesh = Mesh(np.array(jax.devices()[:N]), ("d",))
+    mesh = Mesh(np.array(_devices[:N]), ("d",))
     in_sh = [NamedSharding(mesh, s) for s in in_specs]
     out_sh = NamedSharding(mesh, out_spec)
     f = jax.jit(exp.call, in_shardings=tuple(in_sh), out_shardings=out_sh)
@@ -72,15 +72,35 @@ def check_sharded(fn, arrays, in_specs, out_spec, expect_collective=False):
 
     collective = "all-reduce" in f.lower(*puts).compile().as_text()
     out = f(*puts)
-    assert np.allclose(np.array(out), ref, atol=1e-4), "mismatch"
-    assert (
-        collective == expect_collective
-    ), f"collective={collective}, expected {expect_collective}"
-    print("shards:", len(out.addressable_shards), "collective:", collective, "OK")
+    assert np.allclose(np.array(out), ref, atol=1e-4)
+    assert collective == expect_collective
 
 
-x = mx.array(np.random.rand(N, 4).astype(np.float32))
-y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
+_x = mx.array(np.random.rand(N, 4).astype(np.float32))
+_y = mx.array(np.random.rand(N, 4).astype(np.float32) + 1)
 
-check_sharded(lambda a, b: mx.log(mx.abs(a - b)) * b, [x, y], [P("d"), P("d")], P("d"))
-check_sharded(lambda a: mx.sum(a, axis=0), [x], [P("d")], P(), expect_collective=True)
+
+@requires_8
+@pytest.mark.parametrize(
+    "fn,arrays,in_specs,out_spec,expect",
+    [
+        pytest.param(
+            lambda a, b: mx.log(mx.abs(a - b)) * b,
+            [_x, _y],
+            [P("d"), P("d")],
+            P("d"),
+            False,
+            id="pointwise",
+        ),
+        pytest.param(
+            lambda a: mx.sum(a, axis=0),
+            [_x],
+            [P("d")],
+            P(),
+            True,
+            id="reduce",
+        ),
+    ],
+)
+def test_sharded(fn, arrays, in_specs, out_spec, expect):
+    check_sharded(fn, arrays, in_specs, out_spec, expect)

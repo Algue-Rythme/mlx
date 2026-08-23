@@ -1,14 +1,7 @@
-import os
-
-os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=8"
-
-import sys
-
-sys.path.insert(0, "/Users/louisbethune/code/mlx/python")
-
 import jax
 import mlx.core as mx
 import numpy as np
+import pytest
 from jax import export as jexport
 from jax._src import xla_bridge as xb
 from jax._src.interpreters import mlir as jmlir
@@ -19,7 +12,12 @@ from jaxlib import _jax
 from jaxlib.mlir.dialects import stablehlo as hlo
 from mlx.export_hlo import export_to_hlo
 
+mx.random.seed(0)
+np.random.seed(0)
+
 B, T, V, D, H, HD, FF = 4, 4, 16, 8, 2, 4, 16
+_devices = jax.devices("cpu")
+requires_8 = pytest.mark.skipif(len(_devices) < 8, reason="need 8 emulated CPU devices")
 
 
 def _ln(x, g, b):
@@ -58,7 +56,7 @@ def train_step(*flat):
 
 
 def to_exported(text, in_avals, out_avals):
-    backend = xb.get_backend()
+    backend = xb.get_backend("cpu")
     with jmlir.make_ir_context():
         module = ir.Module.parse(text)
         ver = hlo.get_version_from_compatibility_requirement(
@@ -91,71 +89,72 @@ def to_exported(text, in_avals, out_avals):
     )
 
 
-def rp(*shape):
+def _rp(*shape):
     return mx.array((np.random.rand(*shape) * 0.2 - 0.1).astype(np.float32))
 
 
-params = [
-    rp(V, D),
-    rp(D, D),
-    rp(D, D),
-    rp(D, D),
-    rp(D, D),
-    rp(D, FF),
-    rp(FF),
-    rp(FF, D),
-    rp(D),
-    rp(D),
-    rp(D),
-    rp(D),
-    rp(D),
-    rp(D, V),
-]
-x = mx.array(np.random.randint(0, V, (B, T)), dtype=mx.uint32)
-y = mx.array(np.random.randint(0, V, (B, T)), dtype=mx.uint32)
-args = [*params, x, y]
+@requires_8
+def test_transformer_fsdp_tp_cp():
+    params = [
+        _rp(V, D),
+        _rp(D, D),
+        _rp(D, D),
+        _rp(D, D),
+        _rp(D, D),
+        _rp(D, FF),
+        _rp(FF),
+        _rp(FF, D),
+        _rp(D),
+        _rp(D),
+        _rp(D),
+        _rp(D),
+        _rp(D),
+        _rp(D, V),
+    ]
+    x = mx.array(np.random.randint(0, V, (B, T)), dtype=mx.uint32)
+    y = mx.array(np.random.randint(0, V, (B, T)), dtype=mx.uint32)
+    args = [*params, x, y]
 
-ref = [np.array(o) for o in train_step(*args)]
-in_avals = [jax.core.ShapedArray(np.array(a).shape, np.array(a).dtype) for a in args]
-out_avals = [jax.core.ShapedArray(o.shape, o.dtype) for o in ref]
-exp = to_exported(export_to_hlo(train_step, *args), in_avals, out_avals)
+    ref = [np.array(o) for o in train_step(*args)]
+    in_avals = [
+        jax.core.ShapedArray(np.array(a).shape, np.array(a).dtype) for a in args
+    ]
+    out_avals = [jax.core.ShapedArray(o.shape, o.dtype) for o in ref]
+    exp = to_exported(export_to_hlo(train_step, *args), in_avals, out_avals)
 
-mesh = Mesh(np.array(jax.devices()[:8]).reshape(2, 2, 2), ("dp", "tp", "cp"))
-DP, TP, CP = "dp", "tp", "cp"
-# FSDP shards params+batch on dp; Megatron TP on tp; context-parallel seq on cp.
-param_specs = [
-    P(DP, TP),  # emb  (V, D)
-    P(DP, TP),
-    P(DP, TP),
-    P(DP, TP),  # wq wk wv (D, D) column-parallel
-    P(TP, DP),  # wo   (D, D) row-parallel
-    P(DP, TP),  # w1   (D, FF) column-parallel
-    P(TP),  # b1   (FF,)
-    P(TP, DP),  # w2   (FF, D) row-parallel
-    P(TP),  # b2   (D,)
-    P(TP),
-    P(TP),
-    P(TP),
-    P(TP),  # g1 c1 g2 c2 (D,)
-    P(DP, TP),  # wout (D, V)
-]
-in_specs = [*param_specs, P(DP, CP), P(DP, CP)]  # x, y (B, T)
-out_specs = [P(), *param_specs]  # loss replicated; params keep layout
+    mesh = Mesh(np.array(_devices[:8]).reshape(2, 2, 2), ("dp", "tp", "cp"))
+    DP, TP, CP = "dp", "tp", "cp"
+    # FSDP shards params+batch on dp; Megatron TP on tp; context-parallel seq on cp.
+    param_specs = [
+        P(DP, TP),  # emb  (V, D)
+        P(DP, TP),
+        P(DP, TP),
+        P(DP, TP),  # wq wk wv (D, D) column-parallel
+        P(TP, DP),  # wo   (D, D) row-parallel
+        P(DP, TP),  # w1   (D, FF) column-parallel
+        P(TP),  # b1   (FF,)
+        P(TP, DP),  # w2   (FF, D) row-parallel
+        P(TP),  # b2   (D,)
+        P(TP),
+        P(TP),
+        P(TP),
+        P(TP),  # g1 c1 g2 c2 (D,)
+        P(DP, TP),  # wout (D, V)
+    ]
+    in_specs = [*param_specs, P(DP, CP), P(DP, CP)]  # x, y (B, T)
+    out_specs = [P(), *param_specs]  # loss replicated; params keep layout
 
-in_sh = [NamedSharding(mesh, s) for s in in_specs]
-out_sh = [NamedSharding(mesh, s) for s in out_specs]
-f = jax.jit(exp.call, in_shardings=tuple(in_sh), out_shardings=tuple(out_sh))
-puts = [jax.device_put(np.array(a), s) for a, s in zip(args, in_sh)]
+    in_sh = [NamedSharding(mesh, s) for s in in_specs]
+    out_sh = [NamedSharding(mesh, s) for s in out_specs]
+    f = jax.jit(exp.call, in_shardings=tuple(in_sh), out_shardings=tuple(out_sh))
+    puts = [jax.device_put(np.array(a), s) for a, s in zip(args, in_sh)]
 
-text = f.lower(*puts).compile().as_text()
-collectives = sorted(
-    {c for c in ["all-reduce", "all-gather", "reduce-scatter"] if c in text}
-)
-outs = f(*puts)
+    text = f.lower(*puts).compile().as_text()
+    collectives = [
+        c for c in ("all-reduce", "all-gather", "reduce-scatter") if c in text
+    ]
+    outs = f(*puts)
 
-for i, (o, r) in enumerate(zip(outs, ref)):
-    assert np.allclose(np.array(o), r, atol=1e-4), f"output {i} mismatch"
-print("devices:", len(jax.devices()), "collectives:", collectives)
-print("loss mlx:", float(ref[0]), "xla:", float(np.array(outs[0])))
-assert collectives, "expected communication under FSDP/TP/CP"
-print("OK: transformer train step matches under FSDP x TP x CP")
+    for o, r in zip(outs, ref):
+        assert np.allclose(np.array(o), r, atol=1e-4)
+    assert collectives, "expected communication under FSDP/TP/CP"

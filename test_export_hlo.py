@@ -1,10 +1,5 @@
 import functools
 import os
-import sys
-
-_local = "/Users/louisbethune/code/mlx/python"
-if os.path.isdir(_local):
-    sys.path.insert(0, _local)
 
 import jax
 import jax.numpy as jnp
@@ -50,6 +45,13 @@ def run_xla(text, inputs):
         )
     res = exe.execute_sharded([jax.device_put(x, dev) for x in inputs])
     return res.disassemble_into_single_device_arrays()
+
+
+def check_device(arr):
+    # run_xla returns a list of per-output lists of single-device shards.
+    while isinstance(arr, list):
+        arr = arr[0]
+    return arr.device.platform
 
 
 def check(fn, *arrays, atol=1e-4):
@@ -405,6 +407,16 @@ def test_number_of_elements():
     assert _primitive(noe, "HIGHEST") == [
         "%B = stablehlo.constant dense<0.125> : tensor<f32>"
     ]
+
+
+def test_outputs_on_accelerator():
+    plat = _backend().platform
+    if plat == "cpu":
+        pytest.skip("no accelerator backend; set EXPORT_HLO_PLATFORM=tpu on a TPU host")
+    a, b = np.array(u(4, 8)), np.array(u(8, 4))
+    outs = run_xla(export_to_hlo(lambda x, y: x @ y, mx.array(a), mx.array(b)), [a, b])
+    for o in outs:
+        assert check_device(o) == plat
 
 
 @pytest.mark.parametrize(
