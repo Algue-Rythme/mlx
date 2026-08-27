@@ -40,6 +40,13 @@ from mlx.export_hlo import export_tree, flatten_args
 from mlx.utils import tree_flatten
 
 _perf = time.perf_counter
+_T0 = time.perf_counter()
+
+
+def _log(msg):
+    print(f"[+{time.perf_counter() - _T0:6.1f}s] {msg}", flush=True)
+
+
 _JDTYPE = {mx.bfloat16: jnp.bfloat16, mx.float32: np.float32, mx.uint32: np.uint32}
 
 
@@ -394,42 +401,38 @@ def bench(
     for ti in range(trials):
         jax.clear_caches()
         # --- MLX path: build = export_tree; compile = HLO -> executable ---
+        _log(f"{tag} trial {ti + 1}/{trials} MLX: exporting graph...")
         t0 = _perf()
         text, _ = export_tree(fns.mlx_adam_step, *mx_args)
         t1 = _perf()
+        _log(f"{tag} MLX: compiling (export took {(t1 - t0) * 1e3:.0f} ms)...")
         exp = to_exported(text, in_avals, out_avals, platform)
         jf = jax.jit(exp.call, in_shardings=tuple(in_sh), out_shardings=tuple(out_sh))
         mlx_comp = jf.lower(*puts).compile()
         t2 = _perf()
+        _log(f"{tag} MLX: running (compile took {(t2 - t1) * 1e3:.0f} ms)...")
         b_ml.append(t1 - t0)
         c_ml.append(t2 - t1)
         r_ml.append(_time_run(mlx_comp, puts, warmup, run_iters))
-        print(
-            f"    {tag} trial {ti + 1}/{trials} mlx: "
-            f"build {b_ml[-1] * 1e3:.0f}  compile {c_ml[-1] * 1e3:.0f}  "
-            f"run {r_ml[-1] * 1e3:.2f} ms",
-            flush=True,
-        )
+        _log(f"{tag} MLX: done, run {r_ml[-1] * 1e3:.2f} ms/step")
 
         jax.clear_caches()
         # --- JAX path: build = trace + lower; compile = lower -> executable ---
+        _log(f"{tag} trial {ti + 1}/{trials} JAX: tracing + lowering...")
         t0 = _perf()
         jf = jax.jit(
             fns.jax_flat_step, in_shardings=tuple(in_sh), out_shardings=tuple(out_sh)
         )
         low = jf.lower(*puts)
         t1 = _perf()
+        _log(f"{tag} JAX: compiling (build took {(t1 - t0) * 1e3:.0f} ms)...")
         jax_comp = low.compile()
         t2 = _perf()
+        _log(f"{tag} JAX: running (compile took {(t2 - t1) * 1e3:.0f} ms)...")
         b_jx.append(t1 - t0)
         c_jx.append(t2 - t1)
         r_jx.append(_time_run(jax_comp, puts, warmup, run_iters))
-        print(
-            f"    {tag} trial {ti + 1}/{trials} jax: "
-            f"build {b_jx[-1] * 1e3:.0f}  compile {c_jx[-1] * 1e3:.0f}  "
-            f"run {r_jx[-1] * 1e3:.2f} ms",
-            flush=True,
-        )
+        _log(f"{tag} JAX: done, run {r_jx[-1] * 1e3:.2f} ms/step")
 
     if dump_dir:
         _dump_hlo(dump_dir, tag, text, low, mlx_comp, jax_comp)
