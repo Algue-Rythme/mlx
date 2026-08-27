@@ -525,6 +525,11 @@ def main():
         rows = []
         for name in args.preset:
             cfg = preset_config(name, args.batch, args.seqlen)
+            print(
+                f"  {name} {layout}: {args.trials} trials "
+                f"({2 * args.trials} cold compiles)...",
+                flush=True,
+            )
             try:
                 r = bench(
                     cfg,
@@ -543,6 +548,13 @@ def main():
                 )
                 print(f"  {name} {layout}: FAIL {type(e).__name__}: {e}")
                 continue
+            print(
+                f"  {name} {layout}: done  "
+                f"build {r.mlx_build * 1e3:.0f}/{r.jax_build * 1e3:.0f}  "
+                f"compile {r.mlx_comp * 1e3:.0f}/{r.jax_comp * 1e3:.0f}  "
+                f"run {r.mlx_run * 1e3:.2f}/{r.jax_run * 1e3:.2f} ms (mlx/jax)",
+                flush=True,
+            )
             rows.append(
                 [
                     name,
@@ -563,6 +575,11 @@ def main():
     with open(args.out, "w") as f:
         f.write("\n".join(report) + "\n")
     print(f"\nwrote {args.out}")
+    if dump_dir:
+        print(
+            "\nto hand off, bundle then copy the archive down:\n"
+            f"  tar czf bench_bundle.tar.gz {args.out} {dump_dir}"
+        )
 
 
 if __name__ == "__main__":
