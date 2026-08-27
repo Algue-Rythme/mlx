@@ -9,16 +9,17 @@ over N independent trials for three phases each:
   compile  StableHLO -> XLA executable
   run      one train step, median per-iter (blocked)
 
-Swept over model sizes (depth x width) and device layouts:
+Swept over Llama-3 GQA presets (1b/3b/8b) and device layouts:
   single   one device, replicated
   dp8      pure data-parallel over 8 devices (batch sharded)
   mesh222  (dp,tp,cp)=(2,2,2) FSDP+TP+CP, same shardings as the test
 
 Run on the 8-device TPU slice, e.g.:
-  python bench_export_hlo_transformer.py --layout single dp8 mesh222
+  python bench_export_hlo_transformer.py --preset 1b 3b 8b --layout single dp8 mesh222
 """
 
 import argparse
+import os
 import statistics
 import time
 from types import SimpleNamespace
@@ -60,11 +61,43 @@ def make_config(depth, width, head_dim, ff_mult, B, T, V):
         V=V,
         D=width,
         H=width // head_dim,
+        KV=width // head_dim,  # MHA
         HD=head_dim,
         L=depth,
         FF=ff_mult * width,
         EPS=1e-5,
         BASE=10000.0,
+        B1=0.9,
+        B2=0.999,
+        LR=1e-3,
+        ADAM_EPS=1e-8,
+    )
+
+
+# Real Llama-3 configs: (layers, d_model, heads, kv_heads, head_dim, swiglu_inter, vocab).
+PRESETS = {
+    "1b": (16, 2048, 32, 8, 64, 8192, 128256),
+    "3b": (28, 3072, 24, 8, 128, 8192, 128256),
+    "8b": (32, 4096, 32, 8, 128, 14336, 128256),
+}
+
+
+def preset_config(name, B, T):
+    L, D, H, KV, HD, FF, V = PRESETS[name]
+    assert H * HD == D and H % KV == 0
+    return SimpleNamespace(
+        name=name,
+        B=B,
+        T=T,
+        V=V,
+        D=D,
+        H=H,
+        KV=KV,
+        HD=HD,
+        L=L,
+        FF=FF,
+        EPS=1e-5,
+        BASE=500000.0,
         B1=0.9,
         B2=0.999,
         LR=1e-3,
@@ -78,17 +111,24 @@ def n_params(cfg):
 
 def make_model_fns(cfg):
     B, T, V, D, H, HD, L, FF = cfg.B, cfg.T, cfg.V, cfg.D, cfg.H, cfg.HD, cfg.L, cfg.FF
+    KV, KVD = cfg.KV, cfg.KV * cfg.HD
+    rep = H // KV
     EPS, BASE = cfg.EPS, cfg.BASE
     B1, B2, LR, AE = cfg.B1, cfg.B2, cfg.LR, cfg.ADAM_EPS
     npar = n_params(cfg)
 
-    # ---- MLX (mirrors the test exactly) ----
+    # ---- MLX: Llama-style decoder with grouped-query attention ----
+    def m_repeat_kv(z):  # [B, KV, T, HD] -> [B, H, T, HD]
+        z = mx.broadcast_to(mx.expand_dims(z, 2), (B, KV, rep, T, HD))
+        return mx.reshape(z, (B, H, T, HD))
+
     def m_attention(x, wq, wk, wv, wo, mask):
         q = mx.swapaxes(mx.reshape(x @ wq, (B, T, H, HD)), 1, 2)
-        k = mx.swapaxes(mx.reshape(x @ wk, (B, T, H, HD)), 1, 2)
-        v = mx.swapaxes(mx.reshape(x @ wv, (B, T, H, HD)), 1, 2)
+        k = mx.swapaxes(mx.reshape(x @ wk, (B, T, KV, HD)), 1, 2)
+        v = mx.swapaxes(mx.reshape(x @ wv, (B, T, KV, HD)), 1, 2)
         q = mx.fast.rope(q, HD, traditional=False, base=BASE, scale=1.0, offset=0)
         k = mx.fast.rope(k, HD, traditional=False, base=BASE, scale=1.0, offset=0)
+        k, v = m_repeat_kv(k), m_repeat_kv(v)
         scores = (q @ mx.swapaxes(k, -1, -2)) * (HD**-0.5)
         scores = mx.where(mask, scores, mx.array(-1e9, dtype=scores.dtype))
         a = mx.softmax(scores, axis=-1) @ v
@@ -139,8 +179,8 @@ def make_model_fns(cfg):
             params += [
                 _rp(D),
                 _rp(D, D),
-                _rp(D, D),
-                _rp(D, D),
+                _rp(D, KVD),
+                _rp(D, KVD),
                 _rp(D, D),
                 _rp(D),
                 _rp(D, FF),
@@ -167,9 +207,15 @@ def make_model_fns(cfg):
 
     def j_attention(x, wq, wk, wv, wo, mask):
         q = jnp.swapaxes(jnp.reshape(x @ wq, (B, T, H, HD)), 1, 2)
-        k = jnp.swapaxes(jnp.reshape(x @ wk, (B, T, H, HD)), 1, 2)
-        v = jnp.swapaxes(jnp.reshape(x @ wv, (B, T, H, HD)), 1, 2)
+        k = jnp.swapaxes(jnp.reshape(x @ wk, (B, T, KV, HD)), 1, 2)
+        v = jnp.swapaxes(jnp.reshape(x @ wv, (B, T, KV, HD)), 1, 2)
         q, k = j_rope(q), j_rope(k)
+        k = jnp.reshape(
+            jnp.broadcast_to(jnp.expand_dims(k, 2), (B, KV, rep, T, HD)), (B, H, T, HD)
+        )
+        v = jnp.reshape(
+            jnp.broadcast_to(jnp.expand_dims(v, 2), (B, KV, rep, T, HD)), (B, H, T, HD)
+        )
         scores = (q @ jnp.swapaxes(k, -1, -2)) * (HD**-0.5)
         scores = jnp.where(mask, scores, jnp.array(-1e9, scores.dtype))
         a = jax.nn.softmax(scores, axis=-1) @ v
@@ -307,7 +353,23 @@ def _time_run(compiled, puts, warmup, iters):
     return statistics.median(ts)
 
 
-def bench(cfg, layout, devices, platform, trials, warmup, run_iters):
+def _dump_hlo(dump_dir, tag, mlx_stablehlo, jax_lowered, mlx_comp, jax_comp):
+    # StableHLO = what each path hands to XLA; optimized = post-XLA (shows fusions/ops).
+    files = {
+        "mlx.stablehlo.mlir": mlx_stablehlo,
+        "jax.stablehlo.mlir": jax_lowered.as_text(),
+        "mlx.optimized.hlo": mlx_comp.as_text(),
+        "jax.optimized.hlo": jax_comp.as_text(),
+    }
+    for suffix, content in files.items():
+        with open(os.path.join(dump_dir, f"{tag}.{suffix}"), "w") as f:
+            f.write(content)
+    print(f"  dumped {tag}.*.{{mlir,hlo}} to {dump_dir}")
+
+
+def bench(
+    cfg, layout, devices, platform, trials, warmup, run_iters, dump_dir=None, tag=""
+):
     fns = make_model_fns(cfg)
     params = fns.mlx_make_params()
     m = [mx.zeros(p.shape, dtype=mx.float32) for p in params]
@@ -356,6 +418,9 @@ def bench(cfg, layout, devices, platform, trials, warmup, run_iters):
         b_jx.append(t1 - t0)
         c_jx.append(t2 - t1)
         r_jx.append(_time_run(jax_comp, puts, warmup, run_iters))
+
+    if dump_dir:
+        _dump_hlo(dump_dir, tag, text, low, mlx_comp, jax_comp)
 
     # parity: native JAX and MLX-exported vs the MLX reference
     err_jx = max(
@@ -407,29 +472,32 @@ def format_table(layout, rows):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
-        "--sizes",
+        "--preset",
         nargs="+",
-        default=["2x256", "4x512", "8x1024"],
-        help="depthxwidth pairs, e.g. 8x1024",
+        default=["1b", "3b", "8b"],
+        choices=list(PRESETS),
+        help="Llama-3 presets to sweep",
     )
     ap.add_argument(
         "--layout",
         nargs="+",
-        default=["single", "dp8", "mesh222"],
+        default=["dp8", "mesh222"],
         choices=["single", "dp8", "mesh222"],
     )
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--run-iters", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--head-dim", type=int, default=64)
-    ap.add_argument("--ff-mult", type=int, default=4)
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--seqlen", type=int, default=64)
-    ap.add_argument("--vocab", type=int, default=8192)
+    ap.add_argument("--seqlen", type=int, default=2048, help="realistic LLM context")
     ap.add_argument(
         "--platform", default=None, help="xla platform; default = jax default"
     )
     ap.add_argument("--out", default="bench_results.md", help="write results here too")
+    ap.add_argument(
+        "--dump-hlo",
+        default=None,
+        help="dir to write StableHLO + optimized HLO per (preset, layout)",
+    )
     args = ap.parse_args()
 
     mx.random.seed(0)
@@ -437,11 +505,13 @@ def main():
     platform = args.platform or xb.get_backend().platform
     devices = jax.devices(platform)
     need = {"single": 1, "dp8": 8, "mesh222": 8}
+    dump_dir = os.path.expanduser(args.dump_hlo) if args.dump_hlo else None
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
     report = [
-        f"# export-hlo transformer bench",
+        "# export-hlo transformer bench (Llama-3 GQA presets)",
         f"platform={platform}  devices={len(devices)}  trials={args.trials}  "
-        f"run_iters={args.run_iters}  batch={args.batch}  seqlen={args.seqlen}  "
-        f"vocab={args.vocab}  head_dim={args.head_dim}  ff_mult={args.ff_mult}",
+        f"run_iters={args.run_iters}  batch={args.batch}  seqlen={args.seqlen}",
     ]
     print(report[0])
     print(report[1])
@@ -453,17 +523,8 @@ def main():
             report.append(msg)
             continue
         rows = []
-        for size in args.sizes:
-            depth, width = (int(s) for s in size.split("x"))
-            cfg = make_config(
-                depth,
-                width,
-                args.head_dim,
-                args.ff_mult,
-                args.batch,
-                args.seqlen,
-                args.vocab,
-            )
+        for name in args.preset:
+            cfg = preset_config(name, args.batch, args.seqlen)
             try:
                 r = bench(
                     cfg,
@@ -473,16 +534,18 @@ def main():
                     args.trials,
                     args.warmup,
                     args.run_iters,
+                    dump_dir=dump_dir,
+                    tag=f"{name}_{layout}",
                 )
             except Exception as e:  # noqa: BLE001
                 rows.append(
-                    [size, f"FAIL: {type(e).__name__}", "", "", "", "", "", "", ""]
+                    [name, f"FAIL: {type(e).__name__}", "", "", "", "", "", "", ""]
                 )
-                print(f"  {size} {layout}: FAIL {type(e).__name__}: {e}")
+                print(f"  {name} {layout}: FAIL {type(e).__name__}: {e}")
                 continue
             rows.append(
                 [
-                    size,
+                    name,
                     f"{r.mlx_build * 1e3:.1f}",
                     f"{r.mlx_comp * 1e3:.1f}",
                     f"{r.mlx_run * 1e3:.3f}",
