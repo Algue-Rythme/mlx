@@ -375,9 +375,20 @@ def _dump_hlo(dump_dir, tag, mlx_stablehlo, jax_lowered, mlx_comp, jax_comp):
 
 
 def bench(
-    cfg, layout, devices, platform, trials, warmup, run_iters, dump_dir=None, tag=""
+    cfg,
+    layout,
+    devices,
+    platform,
+    trials,
+    warmup,
+    run_iters,
+    dump_dir=None,
+    tag="",
+    verify=False,
 ):
     fns = make_model_fns(cfg)
+    npar = n_params(cfg)
+    _log(f"{tag}: allocating params + inputs...")
     params = fns.mlx_make_params()
     m = [mx.zeros(p.shape, dtype=mx.float32) for p in params]
     v = [mx.zeros(p.shape, dtype=mx.float32) for p in params]
@@ -386,13 +397,32 @@ def bench(
     y = mx.array(np.random.randint(0, cfg.V, (cfg.B, cfg.T)), dtype=mx.uint32)
     mx_args = (params, m, v, t, x, y)
     flat_in = flatten_args(*mx_args)
-
-    ref_leaves = [o for _, o in tree_flatten(fns.mlx_adam_step(*mx_args))]
-    ref = [np.array(o.astype(mx.float32)) for o in ref_leaves]
     in_avals = [jax.core.ShapedArray(a.shape, _JDTYPE[a.dtype]) for a in flat_in]
-    out_avals = [jax.core.ShapedArray(o.shape, _JDTYPE[o.dtype]) for o in ref_leaves]
+
+    # Output layout: [loss, *p2(param dtype), *m2(f32), *v2(f32), t2].
+    ref = None
+    if verify:
+        # MLX has no TPU backend on Linux, so this runs eager on CPU -- slow for
+        # big models. Only for correctness checks, not the timed path.
+        _log(f"{tag}: computing MLX reference on host CPU (slow)...")
+        ref_leaves = [o for _, o in tree_flatten(fns.mlx_adam_step(*mx_args))]
+        ref = [np.array(o.astype(mx.float32)) for o in ref_leaves]
+        out_avals = [
+            jax.core.ShapedArray(o.shape, _JDTYPE[o.dtype]) for o in ref_leaves
+        ]
+    else:
+        pf = flat_in[:npar]
+        sa, f32 = jax.core.ShapedArray, np.float32
+        out_avals = (
+            [sa((), f32)]
+            + [sa(p.shape, _JDTYPE[p.dtype]) for p in pf]
+            + [sa(p.shape, f32) for p in pf]
+            + [sa(p.shape, f32) for p in pf]
+            + [sa((), f32)]
+        )
 
     in_sh, out_sh = build_shardings(cfg, layout, devices)
+    _log(f"{tag}: placing {len(flat_in)} inputs on {layout}...")
     puts = [jax.device_put(_to_jax(a), s) for a, s in zip(flat_in, in_sh)]
 
     b_ml, c_ml, r_ml = [], [], []
@@ -437,15 +467,18 @@ def bench(
     if dump_dir:
         _dump_hlo(dump_dir, tag, text, low, mlx_comp, jax_comp)
 
-    # parity: native JAX and MLX-exported vs the MLX reference
-    err_jx = max(
-        float(np.abs(_f32(o).reshape(r.shape) - r).max())
-        for o, r in zip(jax_comp(*puts), ref)
-    )
-    err_ml = max(
-        float(np.abs(_f32(o).reshape(r.shape) - r).max())
-        for o, r in zip(mlx_comp(*puts), ref)
-    )
+    # parity vs the MLX reference (only when --verify computed one)
+    if ref is not None:
+        err_jx = max(
+            float(np.abs(_f32(o).reshape(r.shape) - r).max())
+            for o, r in zip(jax_comp(*puts), ref)
+        )
+        err_ml = max(
+            float(np.abs(_f32(o).reshape(r.shape) - r).max())
+            for o, r in zip(mlx_comp(*puts), ref)
+        )
+    else:
+        err_jx = err_ml = None
     med = statistics.median
     return SimpleNamespace(
         mlx_build=med(b_ml),
@@ -513,6 +546,11 @@ def main():
         default=None,
         help="dir to write StableHLO + optimized HLO per (preset, layout)",
     )
+    ap.add_argument(
+        "--verify",
+        action="store_true",
+        help="check parity vs MLX (runs MLX eager on CPU -- slow for big models)",
+    )
     args = ap.parse_args()
 
     mx.random.seed(0)
@@ -556,6 +594,7 @@ def main():
                     args.run_iters,
                     dump_dir=dump_dir,
                     tag=f"{name}_{layout}",
+                    verify=args.verify,
                 )
             except Exception as e:  # noqa: BLE001
                 rows.append(
@@ -580,7 +619,7 @@ def main():
                     f"{r.jax_comp * 1e3:.1f}",
                     f"{r.jax_run * 1e3:.3f}",
                     f"{r.mlx_run / r.jax_run:.2f}",
-                    f"{r.err_jx:.1e}/{r.err_ml:.1e}",
+                    f"{r.err_jx:.1e}/{r.err_ml:.1e}" if r.err_jx is not None else "n/a",
                 ]
             )
         table = format_table(layout, rows)
