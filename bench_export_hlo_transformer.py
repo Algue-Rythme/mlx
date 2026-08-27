@@ -391,7 +391,7 @@ def bench(
     b_ml, c_ml, r_ml = [], [], []
     b_jx, c_jx, r_jx = [], [], []
     mlx_comp = jax_comp = None
-    for _ in range(trials):
+    for ti in range(trials):
         jax.clear_caches()
         # --- MLX path: build = export_tree; compile = HLO -> executable ---
         t0 = _perf()
@@ -404,6 +404,12 @@ def bench(
         b_ml.append(t1 - t0)
         c_ml.append(t2 - t1)
         r_ml.append(_time_run(mlx_comp, puts, warmup, run_iters))
+        print(
+            f"    {tag} trial {ti + 1}/{trials} mlx: "
+            f"build {b_ml[-1] * 1e3:.0f}  compile {c_ml[-1] * 1e3:.0f}  "
+            f"run {r_ml[-1] * 1e3:.2f} ms",
+            flush=True,
+        )
 
         jax.clear_caches()
         # --- JAX path: build = trace + lower; compile = lower -> executable ---
@@ -418,6 +424,12 @@ def bench(
         b_jx.append(t1 - t0)
         c_jx.append(t2 - t1)
         r_jx.append(_time_run(jax_comp, puts, warmup, run_iters))
+        print(
+            f"    {tag} trial {ti + 1}/{trials} jax: "
+            f"build {b_jx[-1] * 1e3:.0f}  compile {c_jx[-1] * 1e3:.0f}  "
+            f"run {r_jx[-1] * 1e3:.2f} ms",
+            flush=True,
+        )
 
     if dump_dir:
         _dump_hlo(dump_dir, tag, text, low, mlx_comp, jax_comp)
