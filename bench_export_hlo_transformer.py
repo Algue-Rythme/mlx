@@ -81,8 +81,11 @@ def make_config(depth, width, head_dim, ff_mult, B, T, V):
     )
 
 
-# Real Llama-3 configs: (layers, d_model, heads, kv_heads, head_dim, swiglu_inter, vocab).
+# Real-shaped GQA configs: (layers, d_model, heads, kv_heads, head_dim, swiglu_inter, vocab).
+# 160m/410m are Pythia-scale; 1b/3b/8b are Llama-3.
 PRESETS = {
+    "160m": (12, 768, 12, 4, 64, 2048, 128256),
+    "410m": (24, 1024, 16, 4, 64, 2816, 128256),
     "1b": (16, 2048, 32, 8, 64, 8192, 128256),
     "3b": (28, 3072, 24, 8, 128, 8192, 128256),
     "8b": (32, 4096, 32, 8, 128, 14336, 128256),
@@ -522,9 +525,9 @@ def main():
     ap.add_argument(
         "--preset",
         nargs="+",
-        default=["1b", "3b", "8b"],
+        default=["160m", "410m", "1b"],
         choices=list(PRESETS),
-        help="Llama-3 presets to sweep",
+        help="GQA presets to sweep (160m/410m/1b/3b/8b)",
     )
     ap.add_argument(
         "--layout",
