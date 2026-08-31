@@ -63,7 +63,9 @@ def check_sharded(fn, arrays, in_specs, out_spec, expect_collective):
         jax.core.ShapedArray(np.array(a).shape, np.array(a).dtype) for a in arrays
     ]
     out_aval = jax.core.ShapedArray(ref.shape, ref.dtype)
-    exp = to_exported(export_to_hlo(fn, *arrays), in_avals, out_aval)
+    exp = to_exported(
+        export_to_hlo(fn, *arrays, precision="highest"), in_avals, out_aval
+    )
 
     mesh = Mesh(np.array(_devices), ("d",))
     in_sh = [NamedSharding(mesh, s) for s in in_specs]

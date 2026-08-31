@@ -192,7 +192,7 @@ def test_adam_transformer_fsdp_tp_cp(dp, tp, cp):
     args = (params, m, v, t, x, y)
 
     ref_leaves = [o for _, o in tree_flatten(adam_step(*args))]
-    text, _ = export_tree(adam_step, *args)
+    text, _ = export_tree(adam_step, *args, precision="highest")
     ref = [np.array(o.astype(mx.float32)) for o in ref_leaves]
 
     flat_in = flatten_args(*args)

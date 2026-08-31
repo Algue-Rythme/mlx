@@ -136,7 +136,9 @@ def test_transformer_fsdp_tp_cp(dp, tp, cp):
         jax.core.ShapedArray(np.array(a).shape, np.array(a).dtype) for a in args
     ]
     out_avals = [jax.core.ShapedArray(o.shape, o.dtype) for o in ref]
-    exp = to_exported(export_to_hlo(train_step, *args), in_avals, out_avals)
+    exp = to_exported(
+        export_to_hlo(train_step, *args, precision="highest"), in_avals, out_avals
+    )
 
     mesh = Mesh(
         np.array(_devices[: dp * tp * cp]).reshape(dp, tp, cp),

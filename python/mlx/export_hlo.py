@@ -1159,7 +1159,7 @@ def _composite(p, cname, decomp, idx):
     return [call], _func(fname, fp["inputs"], fp["outputs"], decomp(fp))
 
 
-def _build(events, composites=frozenset(), precision="highest"):
+def _build(events, precision, composites=frozenset()):
     inputs, outputs, constants, primitives = [], [], [], []
     for e in events:
         t = e["type"]
@@ -1196,7 +1196,7 @@ def _build(events, composites=frozenset(), precision="highest"):
 
 
 def export_to_hlo(
-    fn: Callable, *args, composites=frozenset(), precision="highest", **kwargs
+    fn: Callable, *args, precision, composites=frozenset(), **kwargs
 ) -> str:
     """Trace ``fn`` on the given inputs and return a StableHLO module as text.
 
@@ -1206,8 +1206,9 @@ def export_to_hlo(
         composites (set): Primitive names to emit as ``stablehlo.composite`` ops
             (with a decomposition body) instead of inlining, e.g. ``{"RMSNorm"}``.
         precision (str): Matmul/convolution precision, one of ``"default"``,
-            ``"high"``, ``"highest"``. ``"highest"`` matches MLX's fp32 accumulation
-            on all backends; ``"default"`` lets the backend pick (e.g. bf16 on TPU).
+            ``"high"``, ``"highest"``. Required (no default) — the caller must
+            choose. ``"highest"`` matches MLX's fp32 accumulation on all backends;
+            ``"default"`` lets the backend pick (e.g. bf16 on TPU).
         kwargs: Example keyword inputs used to trace ``fn``.
 
     Returns:
@@ -1215,7 +1216,7 @@ def export_to_hlo(
     """
     events = []
     mx.export_function(events.append, fn, *args, **kwargs)
-    return _build(events, composites, precision)
+    return _build(events, precision, composites)
 
 
 def _flat(tree):
@@ -1236,9 +1237,7 @@ def unflatten_out(leaves: list, out_keys: list) -> Any:
     return tree_unflatten(list(zip(out_keys, leaves)))
 
 
-def export_tree(
-    fn: Callable, *args, composites=frozenset(), precision="highest"
-) -> tuple:
+def export_tree(fn: Callable, *args, precision, composites=frozenset()) -> tuple:
     """Export ``fn`` over pytree arguments (e.g. an ``nn.Module``'s parameters).
 
     Args:

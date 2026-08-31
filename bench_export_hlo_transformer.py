@@ -363,18 +363,12 @@ def _time_run(compiled, puts, warmup, iters):
     return statistics.median(ts)
 
 
-def _dump_hlo(dump_dir, tag, mlx_stablehlo, jax_lowered, mlx_comp, jax_comp):
-    # StableHLO = what each path hands to XLA; optimized = post-XLA (shows fusions/ops).
-    files = {
-        "mlx.stablehlo.mlir": mlx_stablehlo,
-        "jax.stablehlo.mlir": jax_lowered.as_text(),
-        "mlx.optimized.hlo": mlx_comp.as_text(),
-        "jax.optimized.hlo": jax_comp.as_text(),
-    }
-    for suffix, content in files.items():
-        with open(os.path.join(dump_dir, f"{tag}.{suffix}"), "w") as f:
-            f.write(content)
-    print(f"  dumped {tag}.*.{{mlir,hlo}} to {dump_dir}")
+def _write_hlo(dump_dir, tag, suffix, content):
+    if not dump_dir:
+        return
+    with open(os.path.join(dump_dir, f"{tag}.{suffix}"), "w") as f:
+        f.write(content)
+    _log(f"  wrote {tag}.{suffix}")
 
 
 def bench(
@@ -388,6 +382,7 @@ def bench(
     dump_dir=None,
     tag="",
     verify=False,
+    precision="highest",
 ):
     fns = make_model_fns(cfg)
     npar = n_params(cfg)
@@ -432,17 +427,22 @@ def bench(
     b_jx, c_jx, r_jx = [], [], []
     mlx_comp = jax_comp = None
     for ti in range(trials):
+        dump = dump_dir if ti == 0 else None  # dump once, on the first trial
         jax.clear_caches()
         # --- MLX path: build = export_tree; compile = HLO -> executable ---
         _log(f"{tag} trial {ti + 1}/{trials} MLX: exporting graph...")
         t0 = _perf()
-        text, _ = export_tree(fns.mlx_adam_step, *mx_args)
+        text, _ = export_tree(fns.mlx_adam_step, *mx_args, precision=precision)
         t1 = _perf()
+        _write_hlo(
+            dump, tag, "mlx.stablehlo.mlir", text
+        )  # BEFORE compile, survives failure
         _log(f"{tag} MLX: compiling (export took {(t1 - t0) * 1e3:.0f} ms)...")
         exp = to_exported(text, in_avals, out_avals, platform)
         jf = jax.jit(exp.call, in_shardings=tuple(in_sh), out_shardings=tuple(out_sh))
         mlx_comp = jf.lower(*puts).compile()
         t2 = _perf()
+        _write_hlo(dump, tag, "mlx.optimized.hlo", mlx_comp.as_text())
         _log(f"{tag} MLX: running (compile took {(t2 - t1) * 1e3:.0f} ms)...")
         b_ml.append(t1 - t0)
         c_ml.append(t2 - t1)
@@ -458,17 +458,16 @@ def bench(
         )
         low = jf.lower(*puts)
         t1 = _perf()
+        _write_hlo(dump, tag, "jax.stablehlo.mlir", low.as_text())  # BEFORE compile
         _log(f"{tag} JAX: compiling (build took {(t1 - t0) * 1e3:.0f} ms)...")
         jax_comp = low.compile()
         t2 = _perf()
+        _write_hlo(dump, tag, "jax.optimized.hlo", jax_comp.as_text())
         _log(f"{tag} JAX: running (compile took {(t2 - t1) * 1e3:.0f} ms)...")
         b_jx.append(t1 - t0)
         c_jx.append(t2 - t1)
         r_jx.append(_time_run(jax_comp, puts, warmup, run_iters))
         _log(f"{tag} JAX: done, run {r_jx[-1] * 1e3:.2f} ms/step")
-
-    if dump_dir:
-        _dump_hlo(dump_dir, tag, text, low, mlx_comp, jax_comp)
 
     # parity vs the MLX reference (only when --verify computed one)
     if ref is not None:
@@ -554,7 +553,19 @@ def main():
         action="store_true",
         help="check parity vs MLX (runs MLX eager on CPU -- slow for big models)",
     )
+    ap.add_argument(
+        "--precision",
+        required=True,
+        choices=["highest", "high", "default"],
+        help="matmul precision for BOTH sides (MLX export + JAX); "
+        "'highest'=fp32 accumulate (MLX semantics), 'default'=bf16 (fastest). "
+        "Required — you must choose.",
+    )
     args = ap.parse_args()
+
+    # Drive both paths from one precision so the comparison is matched, not
+    # MLX-fp32 vs JAX-bf16. MLX: export_tree(precision=...); JAX: config below.
+    jax.config.update("jax_default_matmul_precision", args.precision)
 
     mx.random.seed(0)
     np.random.seed(0)
@@ -567,7 +578,8 @@ def main():
     report = [
         "# export-hlo transformer bench (Llama-3 GQA presets)",
         f"platform={platform}  devices={len(devices)}  trials={args.trials}  "
-        f"run_iters={args.run_iters}  batch={args.batch}  seqlen={args.seqlen}",
+        f"run_iters={args.run_iters}  batch={args.batch}  seqlen={args.seqlen}  "
+        f"precision={args.precision}",
     ]
     print(report[0])
     print(report[1])
@@ -598,6 +610,7 @@ def main():
                     dump_dir=dump_dir,
                     tag=f"{name}_{layout}",
                     verify=args.verify,
+                    precision=args.precision,
                 )
             except Exception as e:  # noqa: BLE001
                 rows.append(

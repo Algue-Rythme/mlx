@@ -59,7 +59,7 @@ def check(fn, *arrays, atol=1e-4):
     np_in = [np.array(a) for a in arrays]
     out = fn(*arrays)
     ref = [np.array(o) for o in (out if isinstance(out, tuple) else (out,))]
-    outs = run_xla(export_to_hlo(fn, *arrays), np_in)
+    outs = run_xla(export_to_hlo(fn, *arrays, precision="highest"), np_in)
     for r, o in zip(ref, outs):
         assert np.allclose(np.asarray(o).reshape(r.shape), r, atol=atol)
 
@@ -70,7 +70,7 @@ def check_cpu(fn, *arrays, atol=1e-4):
     out = fn(*arrays)
     ref = [np.array(o) for o in (out if isinstance(out, tuple) else (out,))]
     with mx.stream(mx.cpu):
-        text = export_to_hlo(fn, *arrays)
+        text = export_to_hlo(fn, *arrays, precision="highest")
     outs = run_xla(text, np_in)
     for r, o in zip(ref, outs):
         assert np.allclose(np.asarray(o).reshape(r.shape), r, atol=atol)
@@ -375,7 +375,7 @@ def test_constant_guardrail():
     big = u(512, 512)
     mx.eval(big)
     with pytest.raises(NotImplementedError):
-        export_to_hlo(lambda a: a + big, u(512, 512))
+        export_to_hlo(lambda a: a + big, u(512, 512), precision="highest")
 
 
 def test_strided_slice_update_rejected():
@@ -384,7 +384,7 @@ def test_strided_slice_update_rejected():
         return a
 
     with pytest.raises(NotImplementedError):
-        export_to_hlo(setstrided, u(6, 8), u(3, 4))
+        export_to_hlo(setstrided, u(6, 8), u(3, 4), precision="highest")
 
 
 def test_cholesky():
@@ -392,7 +392,9 @@ def test_cholesky():
     spd = mx.array(np.linalg.cholesky(m) @ np.linalg.cholesky(m).T, dtype=mx.float32)
     with mx.stream(mx.cpu):
         ref = np.array(mx.linalg.cholesky(spd))
-    text = export_to_hlo(lambda a: mx.linalg.cholesky(a, stream=mx.cpu), spd)
+    text = export_to_hlo(
+        lambda a: mx.linalg.cholesky(a, stream=mx.cpu), spd, precision="highest"
+    )
     outs = run_xla(text, [np.array(spd)])
     assert np.allclose(np.asarray(outs[0]).reshape(ref.shape), ref, atol=1e-4)
 
@@ -414,7 +416,12 @@ def test_outputs_on_accelerator():
     if plat == "cpu":
         pytest.skip("no accelerator backend; set EXPORT_HLO_PLATFORM=tpu on a TPU host")
     a, b = np.array(u(4, 8)), np.array(u(8, 4))
-    outs = run_xla(export_to_hlo(lambda x, y: x @ y, mx.array(a), mx.array(b)), [a, b])
+    outs = run_xla(
+        export_to_hlo(
+            lambda x, y: x @ y, mx.array(a), mx.array(b), precision="highest"
+        ),
+        [a, b],
+    )
     for o in outs:
         assert check_device(o) == plat
 
@@ -517,7 +524,9 @@ def test_multistep_convergence():
         mo = train_step(*mp, x, y)
         mlx_losses.append(float(mo[0]))
         mp = list(mo[1:])
-        text = export_to_hlo(train_step, *[mx.array(p) for p in xp], x, y)
+        text = export_to_hlo(
+            train_step, *[mx.array(p) for p in xp], x, y, precision="highest"
+        )
         outs = run_xla(text, [*xp, xn, yn])
         xla_losses.append(float(np.asarray(outs[0]).reshape(())))
         xp = [
@@ -532,7 +541,9 @@ def test_bf16_attention():
     qm = mx.array(q32).astype(mx.bfloat16)
     ref = np.array(attention(qm, qm, qm).astype(mx.float32))
     qbf = jnp.asarray(q32).astype(jnp.bfloat16)
-    outs = run_xla(export_to_hlo(attention, qm, qm, qm), [qbf, qbf, qbf])
+    outs = run_xla(
+        export_to_hlo(attention, qm, qm, qm, precision="highest"), [qbf, qbf, qbf]
+    )
     o = np.asarray(outs[0]).astype(np.float32).reshape(ref.shape)
     assert np.allclose(o, ref, atol=2e-2), np.abs(o - ref).max()
 
@@ -551,7 +562,7 @@ def test_bf16_attention():
 )
 def test_composite(name, composite, fn, nargs):
     args = (u(3, 8), u(8), u(8))[:nargs]
-    text = export_to_hlo(fn, *args, composites={composite})
+    text = export_to_hlo(fn, *args, composites={composite}, precision="highest")
     if f'stablehlo.composite "{name}"' not in text:
         pytest.skip("fast ops decompose on this device; no fused primitive to wrap")
     assert f"func.func private @{name.replace('.', '_')}_0" in text
@@ -577,7 +588,7 @@ def test_pytree_module_step():
 
     xd, yd = u(5, 8), u(5, 4)
     ref = [np.array(v) for _, v in tree_flatten(mstep(p0, xd, yd))]
-    hlo, _ = export_tree(mstep, p0, xd, yd)
+    hlo, _ = export_tree(mstep, p0, xd, yd, precision="highest")
     outs = run_xla(hlo, [np.array(a) for a in flatten_args(p0, xd, yd)])
     assert len(outs) == len(ref)
     for r, o in zip(ref, outs):
@@ -620,7 +631,7 @@ def test_bf16_adam_step():
         np.array(o.astype(mx.float32))
         for _, o in tree_flatten(adam(ap, amm, avv, t, xd, yd))
     ]
-    hlo, _ = export_tree(adam, ap, amm, avv, t, xd, yd)
+    hlo, _ = export_tree(adam, ap, amm, avv, t, xd, yd, precision="highest")
 
     def to_jax(a):
         n = np.array(a.astype(mx.float32) if a.dtype == mx.bfloat16 else a)
